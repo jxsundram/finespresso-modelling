@@ -33,6 +33,9 @@ from utils.db.price_move_db_util import store_price_move, PriceMove
 # Load environment variables
 load_dotenv()
 
+# Ensure logs directory exists
+os.makedirs('logs', exist_ok=True)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +46,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+logger.info('Script started')
 
 class DatabaseBackfillProcessor:
     def __init__(self):
@@ -58,6 +63,7 @@ class DatabaseBackfillProcessor:
             'price_moves_stored_csv': 0,
             'errors': 0
         }
+        self.failed_news = []
         
     def extract_ticker_from_company(self, company_name: str, news_text: str = "") -> Optional[str]:
         """Extract ticker symbol from company name using OpenAI."""
@@ -132,8 +138,8 @@ class DatabaseBackfillProcessor:
             logger.debug(f"Getting price data for {ticker} on {yf_today_date}, market: {market}")
             
             # Download price data
-            data = yf.download(ticker, start=yf_prev_date, end=yf_next_date, interval='1d')
-            index_data = yf.download(self.index_symbol, start=yf_prev_date, end=yf_next_date, interval='1d')
+            data = yf.download(ticker, start=yf_prev_date, end=yf_next_date, interval='1d', auto_adjust=False)
+            index_data = yf.download(self.index_symbol, start=yf_prev_date, end=yf_next_date, interval='1d', auto_adjust=False)
             
             if data.empty or index_data.empty:
                 logger.warning(f"No price data available for {ticker}")
@@ -212,7 +218,7 @@ class DatabaseBackfillProcessor:
                 if price_data:
                     # Combine news data with price data
                     combined_data = {
-                        'news_id': row['id'],
+                        'news_id': row['news_id'],
                         'title': row.get('title', ''),
                         'description': row.get('content', ''),
                         'link': row.get('link', ''),
@@ -228,7 +234,7 @@ class DatabaseBackfillProcessor:
                     
                     # Store to database
                     price_move_obj = PriceMove(
-                        news_id=row['id'],
+                        news_id=row['news_id'],
                         ticker=ticker,
                         published_date=published_date,
                         begin_price=price_data['begin_price'],
@@ -251,14 +257,21 @@ class DatabaseBackfillProcessor:
                     if store_price_move(price_move_obj):
                         self.stats['price_moves_stored_db'] += 1
                     else:
-                        logger.warning(f"Failed to store price move for news_id {row['id']}")
+                        logger.warning(f"Failed to store price move for news_id {row['news_id']}")
                 
                 # Add small delay to avoid rate limiting
                 time_module.sleep(0.1)
                 
             except Exception as e:
-                logger.error(f"Error processing news item {row.get('id', 'unknown')}: {e}")
+                logger.error(f"Error processing news item {row.get('news_id', 'unknown')}: {e}")
                 self.stats['errors'] += 1
+                self.failed_news.append({
+                    'news_id': row.get('news_id', 'unknown'),
+                    'ticker': row.get('ticker', ''),
+                    'yf_ticker': row.get('yf_ticker', ''),
+                    'published_date': row.get('published_date', ''),
+                    'error': str(e)
+                })
         
         self.stats['price_moves_calculated'] = processed_count
         logger.info(f"Successfully processed {processed_count} price moves for news with tickers")
@@ -284,7 +297,7 @@ class DatabaseBackfillProcessor:
                 
                 if ticker:
                     extracted_tickers.append({
-                        'news_id': row['id'],
+                        'news_id': row['news_id'],
                         'ticker': ticker,
                         'yf_ticker': ticker,
                         'instrument_id': None,
@@ -297,7 +310,7 @@ class DatabaseBackfillProcessor:
                 time_module.sleep(0.2)
                 
             except Exception as e:
-                logger.error(f"Error extracting ticker for news item {row.get('id', 'unknown')}: {e}")
+                logger.error(f"Error extracting ticker for news item {row.get('news_id', 'unknown')}: {e}")
                 self.stats['errors'] += 1
         
         self.stats['ticker_extracted'] = extracted_count
@@ -310,7 +323,7 @@ class DatabaseBackfillProcessor:
         
         return extracted_tickers
     
-    def save_results_to_csv(self, price_moves_df: pd.DataFrame, output_dir: str = 'data'):
+    def save_results_to_csv(self, price_moves_df: pd.DataFrame, output_dir: str = '../data'):
         """Save price moves results to CSV file with timestamp."""
         if price_moves_df.empty:
             logger.warning("No price moves data to save to CSV")
@@ -325,6 +338,12 @@ class DatabaseBackfillProcessor:
         price_moves_df.to_csv(filepath, index=False)
         self.stats['price_moves_stored_csv'] = len(price_moves_df)
         logger.info(f"Saved {len(price_moves_df)} price moves to {filepath}")
+        
+        if self.failed_news:
+            failed_filepath = os.path.join(os.path.dirname(filepath), f'failed_price_moves_{timestamp}.csv')
+            pd.DataFrame(self.failed_news).to_csv(failed_filepath, index=False)
+            logger.info(f"Saved failed news items to: {failed_filepath}")
+            print(f"Saved failed news items to: {failed_filepath}")
         
         return filepath
     
@@ -349,8 +368,10 @@ class DatabaseBackfillProcessor:
         
         # Get all news from database
         logger.info("Fetching all news from database...")
-        news_df = get_news_df()
+        news_df = get_news_df().head(500)
         self.stats['total_news'] = len(news_df)
+        logger.info(f"Columns: {news_df.columns.tolist()}")
+        logger.info(f"Sample row: {news_df.head(1).to_dict()}")
         
         if news_df.empty:
             logger.warning("No news found in database")
@@ -381,11 +402,11 @@ class DatabaseBackfillProcessor:
             if extracted_tickers:
                 # Get the news items that now have tickers
                 news_ids_with_tickers = [item['news_id'] for item in extracted_tickers]
-                news_with_new_tickers = news_without_ticker[news_without_ticker['id'].isin(news_ids_with_tickers)].copy()
+                news_with_new_tickers = news_without_ticker[news_without_ticker['news_id'].isin(news_ids_with_tickers)].copy()
                 
                 # Update the ticker columns
                 for item in extracted_tickers:
-                    mask = news_with_new_tickers['id'] == item['news_id']
+                    mask = news_with_new_tickers['news_id'] == item['news_id']
                     news_with_new_tickers.loc[mask, 'ticker'] = item['ticker']
                     news_with_new_tickers.loc[mask, 'yf_ticker'] = item['yf_ticker']
                 
@@ -399,6 +420,7 @@ class DatabaseBackfillProcessor:
         if not price_moves_df.empty:
             csv_filepath = self.save_results_to_csv(price_moves_df)
             logger.info(f"Backfill results saved to: {csv_filepath}")
+            print(f"Backfill results saved to: {csv_filepath}")
         
         # Print statistics
         self.print_statistics()
