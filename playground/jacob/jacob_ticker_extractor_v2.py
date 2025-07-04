@@ -121,20 +121,31 @@ def extract_tickers_from_news(df, api_key, title_col='title', content_col='summa
 # Load environment variables from .env file
 load_dotenv()
 
-# Prompt for or find the latest energy_news_*.csv file
+# Prompt for or find the latest news_*.csv file
 if len(sys.argv) > 1:
     input_csv = sys.argv[1]
 else:
     # Only use files that do NOT contain 'with_tickers' in the name
-    files = sorted([f for f in glob.glob("energy_news_*.csv") if "with_tickers" not in f], reverse=True)
+    files = sorted([f for f in glob.glob("*_news_*.csv") if "with_tickers" not in f], reverse=True)
     if files:
         input_csv = files[0]
         print(f"Using latest file: {input_csv}")
     else:
-        raise FileNotFoundError("No raw energy_news_*.csv file found. Please provide a CSV filename as an argument.")
+        raise FileNotFoundError("No raw news_*.csv file found. Please provide a CSV filename as an argument.")
 
 # Load the news data
 news_df = pd.read_csv(input_csv)
+
+# Extract industry prefix from input filename
+base = os.path.basename(input_csv)
+if "_news_" in base:
+    industry_prefix = base.split("_news_")[0]
+else:
+    industry_prefix = "news"
+
+# Limit to first 500 news items
+news_df = news_df.head(500)
+#remove if wanting to run whole dataset overnight
 
 # Extract tickers (API key loaded from environment)
 API_KEY = os.getenv("API_KEY")
@@ -142,7 +153,7 @@ result = extract_tickers_from_news(news_df, API_KEY, title_col='title', content_
 
 # Save results with timestamp
 timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-filename = f"energy_news_with_tickers_{timestamp}.csv"
+filename = f"{industry_prefix}_news_with_tickers_{timestamp}.csv"
 result.to_csv(filename, index=False)
 print(f"Saved results to {filename}")
 

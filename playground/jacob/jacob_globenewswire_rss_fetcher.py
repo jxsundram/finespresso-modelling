@@ -13,6 +13,7 @@ from datetime import datetime
 import requests
 from urllib.parse import urlparse
 import re
+import urllib.parse
 
 def fetch_rss_news(rss_url, max_items=None):
     """
@@ -56,34 +57,39 @@ def fetch_rss_news(rss_url, max_items=None):
                     pub_date = datetime(*entry.published_parsed[:6])
                 elif hasattr(entry, 'updated_parsed') and isinstance(entry.updated_parsed, tuple):
                     pub_date = datetime(*entry.updated_parsed[:6])
-                elif hasattr(entry, 'published'):
+                elif hasattr(entry, 'published') and isinstance(entry.published, str):
                     # Try to parse published date string
                     try:
                         pub_date = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %z')
                     except:
                         pub_date = entry.published
+                elif hasattr(entry, 'published'):
+                    pub_date = entry.published
 
                 # Clean up summary/description
                 summary = ""
-                if hasattr(entry, 'summary'):
+                if hasattr(entry, 'summary') and isinstance(entry.summary, str):
                     summary = entry.summary
-                elif hasattr(entry, 'description'):
+                elif hasattr(entry, 'description') and isinstance(entry.description, str):
                     summary = entry.description
 
                 # Remove HTML tags from summary
-                summary = re.sub(r'<[^>]+>', '', summary).strip()
+                if isinstance(summary, str):
+                    summary = re.sub(r'<[^>]+>', '', summary).strip()
+                else:
+                    summary = ''
 
                 # Extract author/source
                 author = ""
-                if hasattr(entry, 'author'):
+                if hasattr(entry, 'author') and isinstance(entry.author, str):
                     author = entry.author
-                elif hasattr(entry, 'source'):
+                elif hasattr(entry, 'source') and isinstance(entry.source, dict):
                     author = entry.source.get('title', '')
 
                 # Extract categories/tags
                 categories = []
-                if hasattr(entry, 'tags'):
-                    categories = [tag.term for tag in entry.tags]
+                if hasattr(entry, 'tags') and isinstance(entry.tags, list):
+                    categories = [tag.term for tag in entry.tags if hasattr(tag, 'term') and isinstance(tag.term, str)]
 
                 # Create news item dictionary
                 news_item = {
@@ -110,14 +116,24 @@ def fetch_rss_news(rss_url, max_items=None):
         df = pd.DataFrame(news_items)
 
         # Sort by publication date (newest first)
-        if 'published_date' in df.columns and not df['published_date'].isna().all():
-            df = df.sort_values('published_date', ascending=False).reset_index(drop=True)
+        if 'published_date' in df.columns:
+            notna_any = df['published_date'].notna().any()
+            if bool(notna_any):
+                df = df.sort_values('published_date', ascending=False).reset_index(drop=True)
 
         print(f"Successfully processed {len(df)} news items")
 
         # Save to CSV
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-        filename = f"energy_news_{timestamp}.csv"
+        # Extract industry name from rss_url
+        # Try to extract after 'News%20on%20' or last slash
+        industry = None
+        if 'News%20on%20' in rss_url:
+            industry = rss_url.split('News%20on%20')[-1]
+        else:
+            industry = rss_url.rstrip('/').split('/')[-1]
+        industry = urllib.parse.unquote(industry).replace(' ', '_').replace('-', '_').lower()
+        filename = f"{industry}_news_{timestamp}.csv"
         df.to_csv(filename, index=False)
         print(f"Saved news to {filename}")
 
@@ -128,6 +144,6 @@ def fetch_rss_news(rss_url, max_items=None):
         return pd.DataFrame()
 
 if __name__ == "__main__":
-    rss_url = "https://www.globenewswire.com/RssFeed/industry/1-Energy/feedTitle/GlobeNewswire%20-%20Industry%20News%20on%20Energy"
+    rss_url = "https://www.globenewswire.com/RssFeed/industry/etc..."
     news_df = fetch_rss_news(rss_url, max_items=50)  # Limit to 50 items for example
     print(news_df.head())

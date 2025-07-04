@@ -108,9 +108,13 @@ class DatabaseBackfillProcessor:
 
             result = response.choices[0].message.content
             try:
-                parsed = json.loads(result)
-                tickers = parsed.get('tickers', [])
-                return tickers[0] if tickers else None
+                if result is not None and isinstance(result, str):
+                    parsed = json.loads(result)
+                    tickers = parsed.get('tickers', [])
+                    return tickers[0] if tickers else None
+                else:
+                    logger.warning(f"OpenAI response content is None or not a string: {result}")
+                    return None
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse OpenAI response: {result}")
                 return None
@@ -154,14 +158,14 @@ class DatabaseBackfillProcessor:
             data = yf.download(ticker, start=yf_prev_date, end=yf_next_date, interval='1d', auto_adjust=True)
             index_data = yf.download(self.index_symbol, start=yf_prev_date, end=yf_next_date, interval='1d', auto_adjust=True)
 
-            if data.empty or index_data.empty:
+            if data is None or index_data is None or data.empty or index_data.empty:
                 logger.warning(f"No price data available for {ticker} between {yf_prev_date} and {yf_next_date}. Data empty.")
                 return None
 
             # Check if relevant dates exist in the downloaded data
             # This handles cases where yfinance returns data but not for the exact requested date
             if market == 'pre_market':
-                if yf_prev_date not in data.index or yf_today_date not in data.index:
+                if data is None or index_data is None or yf_prev_date not in data.index or yf_today_date not in data.index:
                     logger.warning(f"Missing required dates for {ticker} (pre_market): {yf_prev_date}, {yf_today_date}")
                     return None
                 begin_price = float(data.loc[yf_prev_date, 'Close'].iloc[0])
@@ -169,7 +173,7 @@ class DatabaseBackfillProcessor:
                 index_begin_price = float(index_data.loc[yf_prev_date, 'Close'].iloc[0])
                 index_end_price = float(index_data.loc[yf_today_date, 'Open'].iloc[0])
             elif market == 'regular_market':
-                if yf_today_date not in data.index:
+                if data is None or index_data is None or yf_today_date not in data.index:
                     logger.warning(f"Missing required date for {ticker} (regular_market): {yf_today_date}")
                     return None
                 begin_price = float(data.loc[yf_today_date, 'Open'].iloc[0])
@@ -177,7 +181,7 @@ class DatabaseBackfillProcessor:
                 index_begin_price = float(index_data.loc[yf_today_date, 'Open'].iloc[0])
                 index_end_price = float(index_data.loc[yf_today_date, 'Close'].iloc[0])
             else:  # after_market
-                if yf_today_date not in data.index or yf_next_date not in data.index:
+                if data is None or index_data is None or yf_today_date not in data.index or yf_next_date not in data.index:
                     logger.warning(f"Missing required dates for {ticker} (after_market): {yf_today_date}, {yf_next_date}")
                     return None
                 begin_price = float(data.loc[yf_today_date, 'Close'].iloc[0])
@@ -192,7 +196,7 @@ class DatabaseBackfillProcessor:
             price_change_percentage = (price_change / begin_price) * 100 if begin_price != 0 else 0
             index_price_change_percentage = (index_price_change / index_begin_price) * 100 if index_begin_price != 0 else 0
 
-            volume = float(data.loc[yf_today_date, 'Volume'].iloc[0]) if yf_today_date in data.index else 0
+            volume = float(data.loc[yf_today_date, 'Volume'].iloc[0]) if data is not None and yf_today_date in data.index else 0
 
             return {
                 'begin_price': begin_price,
@@ -247,11 +251,16 @@ def process_csv_for_price_moves(csv_filepath: str, output_dir: str = 'data') -> 
             ticker = row.get('yf_ticker')
             if not ticker:
                 ticker = row.get('ticker')
-            if not ticker or pd.isna(row['published_date']):
-                logger.warning(f"Skipping row {index} due to missing ticker or published_date: {row.get('id')}")
-                continue
             published_date = row['published_date']
-            logger.info(f"Processing {ticker} on {published_date.strftime('%Y-%m-%d %H:%M:%S')}")
+            # Now check if it's a valid datetime
+            if not isinstance(published_date, datetime) or pd.isnull(published_date):
+                logger.warning(f"Skipping row {index} due to missing or invalid published_date: {row.get('id')}")
+                continue
+            if not ticker:
+                logger.warning(f"Skipping row {index} due to missing ticker: {row.get('id')}")
+                continue
+            date_str = published_date.strftime('%Y-%m-%d %H:%M:%S')
+            logger.info(f"Processing {ticker} on {date_str}")
             price_data = processor.get_price_data(ticker, published_date)
             if price_data:
                 combined_data = {
@@ -269,7 +278,7 @@ def process_csv_for_price_moves(csv_filepath: str, output_dir: str = 'data') -> 
                 price_moves_results.append(combined_data)
                 processor.stats['price_moves_calculated'] += 1
             else:
-                logger.warning(f"Could not get price data for {ticker} on {published_date.strftime('%Y-%m-%d %H:%M:%S')}. Skipping.")
+                logger.warning(f"Could not get price data for {ticker} on {date_str}. Skipping.")
                 processor.stats['errors'] += 1
             time_module.sleep(0.1)
         results_df = pd.DataFrame(price_moves_results)
@@ -295,11 +304,100 @@ def process_csv_for_price_moves(csv_filepath: str, output_dir: str = 'data') -> 
         return pd.DataFrame()
 
 if __name__ == "__main__":
-    # Path to your uploaded CSV file
-    csv_file = 'energy_news_with_tickers_20250702_1746.csv'
+    import sys, glob, os
+    if len(sys.argv) > 1:
+        csv_file = sys.argv[1]
+    else:
+        files = sorted([f for f in glob.glob("*_news_with_tickers_*.csv")], reverse=True)
+        if files:
+            csv_file = files[0]
+            print(f"Using latest file: {csv_file}")
+        else:
+            raise FileNotFoundError("No *_news_with_tickers_*.csv file found. Please provide a CSV filename as an argument.")
     
+    # Extract industry prefix from filename
+    base = os.path.basename(csv_file)
+    if "_news_" in base:
+        industry_prefix = base.split("_news_")[0]
+    else:
+        industry_prefix = "news"
+
     # Run the processing
-    final_price_moves_df = process_csv_for_price_moves(csv_file)
+    def process_csv_for_price_moves_with_industry(csv_filepath: str, output_dir: str = 'data', industry_prefix: str = "news") -> pd.DataFrame:
+        logger.info(f"Starting CSV processing for {csv_filepath}...")
+        processor = DatabaseBackfillProcessor()
+        try:
+            news_df = pd.read_csv(csv_filepath)
+            # If 'tickers' column exists, parse and explode it
+            if 'tickers' in news_df.columns:
+                import ast
+                news_df['tickers'] = news_df['tickers'].apply(lambda x: ast.literal_eval(x) if pd.notnull(x) else [])
+                news_df = news_df.explode('tickers')
+                news_df = news_df.rename(columns={'tickers': 'ticker'})
+            # Ensure 'published_date' is datetime object
+            if 'published_date' not in news_df.columns:
+                logger.warning("Input CSV is missing 'published_date' column. Cannot proceed.")
+                return pd.DataFrame()
+            news_df['published_date'] = pd.to_datetime(news_df['published_date'], errors='coerce')
+            logger.info(f"Loaded {len(news_df)} news items from CSV after exploding tickers.")
+
+            price_moves_results = []
+            for index, row in news_df.iterrows():
+                ticker = row.get('yf_ticker')
+                if not ticker:
+                    ticker = row.get('ticker')
+                published_date = row['published_date']
+                # Now check if it's a valid datetime
+                if not isinstance(published_date, datetime) or pd.isnull(published_date):
+                    logger.warning(f"Skipping row {index} due to missing or invalid published_date: {row.get('id')}")
+                    continue
+                if not ticker:
+                    logger.warning(f"Skipping row {index} due to missing ticker: {row.get('id')}")
+                    continue
+                date_str = published_date.strftime('%Y-%m-%d %H:%M:%S')
+                logger.info(f"Processing {ticker} on {date_str}")
+                price_data = processor.get_price_data(ticker, published_date)
+                if price_data:
+                    combined_data = {
+                        'news_id': row.get('id', index),
+                        'title': row.get('title', ''),
+                        'description': row.get('content', ''),
+                        'link': row.get('link', ''),
+                        'company': row.get('company', ''),
+                        'ticker': ticker,
+                        'published_date': published_date,
+                        'publisher': row.get('publisher', ''),
+                        'language': row.get('language', ''),
+                        **price_data
+                    }
+                    price_moves_results.append(combined_data)
+                    processor.stats['price_moves_calculated'] += 1
+                else:
+                    logger.warning(f"Could not get price data for {ticker} on {date_str}. Skipping.")
+                    processor.stats['errors'] += 1
+                time_module.sleep(0.1)
+            results_df = pd.DataFrame(price_moves_results)
+            if not results_df.empty:
+                # Save to main /data directory at project root
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                output_dir_main = os.path.join(project_root, 'data')
+                os.makedirs(output_dir_main, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                output_filename = f'{industry_prefix}_news_price_moves_{timestamp}.csv'
+                output_filepath = os.path.join(output_dir_main, output_filename)
+                results_df.to_csv(output_filepath, index=False)
+                logger.info(f"Saved {len(results_df)} price moves to {output_filepath}")
+                print(f"Saved price moves to {output_filepath}")
+                processor.stats['price_moves_stored_csv'] = len(results_df)
+            else:
+                logger.warning("No price moves were calculated for any news items.")
+            return results_df
+        except Exception as e:
+            logger.error(f"An error occurred during CSV processing: {e}")
+            logger.exception("Full traceback:")
+            return pd.DataFrame()
+
+    final_price_moves_df = process_csv_for_price_moves_with_industry(csv_file, industry_prefix=industry_prefix)
 
     if not final_price_moves_df.empty:
         logger.info("\nSample of calculated price moves:")
